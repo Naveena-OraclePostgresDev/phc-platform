@@ -521,7 +521,8 @@ elif page == "Ask AI":
     low_stock_count = stock_analysis[(stock_analysis['closing_stock'] < (0.2 * stock_analysis['peak_stock']))].shape[0]
     zero_stock_count = df_latest[df_latest['closing_stock'] <= 0].shape[0]
 
-    top_critical_pairs = df_latest[df_latest['closing_stock'] <= 5][['phc_name', 'district', 'medicine', 'closing_stock']].head(10).to_dict(orient='records')
+    crit = df_latest[['phc_name', 'district', 'medicine', 'closing_stock']].sort_values('closing_stock')
+    top_critical_pairs = crit.groupby(['district', 'medicine']).head(3).sort_values(['district', 'medicine']).to_csv(index=False)
     top_consumed = df_filtered.groupby('medicine')['units_consumed'].sum().sort_values(ascending=False).head(5).to_dict()
 
     system_data_context = f"""
@@ -532,7 +533,9 @@ elif page == "Ask AI":
     PHC-Medicine pairs currently at ZERO stock: {zero_stock_count}
     PHC-Medicine pairs below 20% peak stock: {low_stock_count}
     Top 5 consumed medicines across districts: {top_consumed}
-    Critical shortage snapshot: {top_critical_pairs}
+    Lowest-stock PHCs for each district and medicine (CSV):
+    {top_critical_pairs}
+    Always answer using specific PHC names and stock numbers from this table.
     """
 
     # Section 1: Executive Briefing
@@ -572,7 +575,7 @@ elif page == "Ask AI":
     if quick_col3.button("🔄 Recommend stock redistribution options"):
         preset_q = "Recommend stock redistribution options between surplus and deficit PHCs."
 
-    user_query = st.chat_input("Type your question here (e.g., 'What are the top risks in Jaipur district?')...")
+    user_query = st.chat_input("Type your question here (e.g., 'What are the top risks in Coimbatore district?')...")
     active_question = preset_q or user_query
 
     if active_question:
