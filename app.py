@@ -1,4 +1,6 @@
 import os
+if not os.path.exists("phc_data.csv"):
+    import generate_data
 import time
 import math
 import streamlit as st
