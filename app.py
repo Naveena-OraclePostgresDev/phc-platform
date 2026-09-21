@@ -169,7 +169,11 @@ if page == "Overview":
     st.subheader("Medicine Consumption Trend")
     trend_data = get_monthly_trends(df, selected_districts)
     fig_trend = px.line(trend_data, x='date', y='units_consumed', line_shape="spline")
-    fig_trend.add_vrect(x0="2024-06-01", x1="2024-09-30", fillcolor="red", opacity=0.1, annotation_text="Monsoon Spike")
+    last_dt = pd.to_datetime(trend_data['date']).max()
+    mon_start = pd.Timestamp(last_dt.year, 6, 1)
+    mon_end = min(pd.Timestamp(last_dt.year, 9, 30), last_dt)
+    if last_dt >= mon_start:
+        fig_trend.add_vrect(x0=mon_start, x1=mon_end, fillcolor="red", opacity=0.1, annotation_text="Monsoon Spike")
     st.plotly_chart(fig_trend, use_container_width=True)
 
     c1, c2 = st.columns(2)
