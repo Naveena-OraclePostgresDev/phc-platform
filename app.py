@@ -82,7 +82,9 @@ def run_forecast_logic(ts_data, forecast_days=30):
     # Calculate Monthly Seasonal Factors
     ts_data['month'] = ts_data['date'].dt.month
     avg_consumption = ts_data['units_consumed'].mean()
-    seasonal_factors = ts_data.groupby('month')['units_consumed'].mean() / avg_consumption
+    month_stats = ts_data.groupby('month')['units_consumed'].agg(['mean', 'count'])
+    month_stats = month_stats[month_stats['count'] >= 20]
+    seasonal_factors = month_stats['mean'] / avg_consumption
     
     # Baseline: Average of last 7 days
     baseline = ts_data['units_consumed'].tail(7).mean()
@@ -244,7 +246,7 @@ elif page == "Demand Forecast":
     # 4. Metrics & Explanation
     c1, c2 = st.columns([1, 3])
     with c1:
-        st.metric("Forecast Accuracy (MAPE)", f"{mape:.2f}%", delta="Back-tested", delta_color="off")
+        st.metric("Forecast Error (MAPE)", f"{mape:.2f}%", delta="Back-tested", delta_color="off")
     with c2:
         st.info(f"""
         **Forecast Summary:**
