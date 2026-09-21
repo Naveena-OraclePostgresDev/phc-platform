@@ -1,7 +1,3 @@
 .streamlit/secrets.toml
-phc_data.csv
 test_gemini.py
-test_gemini2.py
-app_backup_askai.py
-app_backup_day7pre.py
 __pycache__/
