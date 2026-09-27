@@ -62,7 +62,15 @@ except FileNotFoundError:
 st.sidebar.title("🏥 Navigation")
 page = st.sidebar.radio(
     "Go to",
-    ["Overview", "PHC Explorer", "Demand Forecast", "Stock-out Alerts", "AI Redistribution", "Ask AI"]
+    [
+        "Overview", 
+        "PHC Explorer", 
+        "Demand Forecast", 
+        "Stock-out Alerts", 
+        "AI Redistribution", 
+        "Federated Learning", 
+        "Ask AI"
+    ]
 )
 
 st.sidebar.divider()
@@ -79,7 +87,6 @@ latest_date = df['date'].max()
 # --- FORECAST LOGIC HELPER ---
 def run_forecast_logic(ts_data, forecast_days=30):
     """Simple seasonal moving average forecast"""
-    # Calculate Monthly Seasonal Factors
     ts_data['month'] = ts_data['date'].dt.month
     avg_consumption = ts_data['units_consumed'].mean()
     month_stats = ts_data.groupby('month')['units_consumed'].agg(['mean', 'count'])
@@ -95,7 +102,6 @@ def run_forecast_logic(ts_data, forecast_days=30):
     
     forecast_vals = []
     for d in future_dates:
-        # Seasonality-adjusted forecast
         factor = seasonal_factors.get(d.month, 1.0)
         forecast_vals.append(baseline * factor)
         
@@ -114,15 +120,13 @@ def get_gemini_api_key():
 def call_gemini_flash(prompt):
     """
     Calls gemini-flash-lite-latest with fail-fast retry:
-    Tries only twice, waiting 2 seconds between tries.
-    If it fails twice, immediately displays a friendly busy message and stops.
+    Tries twice, waiting 2 seconds between tries.
     """
     api_key = get_gemini_api_key()
     max_retries = 2
 
     for attempt in range(max_retries):
         try:
-            # Preferred SDK: google-genai
             try:
                 from google import genai
                 client = genai.Client(api_key=api_key) if api_key else genai.Client()
@@ -132,7 +136,6 @@ def call_gemini_flash(prompt):
                 )
                 return response.text
             except ImportError:
-                # Fallback SDK: google-generativeai
                 import google.generativeai as legacy_genai
                 if api_key:
                     legacy_genai.configure(api_key=api_key)
@@ -149,6 +152,225 @@ def call_gemini_flash(prompt):
                 st.stop()
 
     return None
+
+# --- FEDERATED LEARNING ENGINE (FedAvg + Differential Privacy) ---
+def render_federated_learning(df, selected_districts):
+    st.title("🌐 Federated AI Demand Forecasting")
+    st.caption("Privacy-preserving cross-jurisdiction machine learning without centralizing raw health records.")
+
+    # 1. Privacy Metrics Banner (Zero raw data leaves local boundaries)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Raw Records Shared", "0", delta="100% Private", delta_color="normal")
+    k2.metric("Data Sovereignty", "Local", delta="Never leaves node", delta_color="normal")
+    k3.metric("Shared Payload", "Weights", delta="No raw records", delta_color="off")
+    k4.metric("Consortium Protocol", "FedAvg", delta="Multi-node", delta_color="off")
+
+    st.divider()
+
+    # 2. Controls & Configuration
+    c_left, c_right = st.columns([1, 2])
+    with c_left:
+        st.subheader("⚙️ Federation Setup")
+        cohort_type = st.radio(
+            "Select Federation Cohort",
+            ["BRICS Alliance (Cross-Border)", "Districts (Inter-Regional)"],
+            help="Choose whether local nodes represent sovereign BRICS nations or domestic districts."
+        )
+
+        rounds = st.slider("Federation Rounds (Global Aggregations)", min_value=3, max_value=20, value=8, step=1)
+        epochs = st.slider("Local Epochs per Round", min_value=1, max_value=10, value=3, step=1)
+        enable_dp = st.toggle("Enable Differential Privacy", value=True, help="Applies L2 gradient clipping and Gaussian noise injection to prevent model inversion.")
+        
+        dp_clip = 1.0
+        dp_noise = 0.05 if enable_dp else 0.0
+
+    # 3. Local Feature Preparation
+    # Each participant prepares local demand forecasting features (Lag-1, Lag-7, Footfall -> Target: Demand)
+    client_data = {}
+    np.random.seed(42)
+
+    if cohort_type.startswith("BRICS"):
+        participants = ["India", "Brazil", "Russia", "China", "South Africa"]
+        # Simulate multi-country pharmaceutical demand patterns
+        for p in participants:
+            n_samples = np.random.randint(180, 300)
+            t = np.linspace(0, 10, n_samples)
+            base_vol = np.random.uniform(200, 800)
+            trend = np.sin(t) * np.random.uniform(30, 80)
+            noise = np.random.normal(0, 15, n_samples)
+            demand = np.maximum(10, base_vol + trend + noise)
+            
+            x1 = np.roll(demand, 1)
+            x2 = np.roll(demand, 7)
+            x3 = demand * np.random.uniform(0.8, 1.2, n_samples)
+            X = np.column_stack([x1[7:], x2[7:], x3[7:]])
+            y = demand[7:]
+            client_data[p] = (X, y)
+    else:
+        # Use available districts from phc_data.csv
+        active_districts = selected_districts if len(selected_districts) >= 2 else sorted(df['district'].unique())[:4]
+        participants = active_districts
+        for dist in participants:
+            dist_slice = df[df['district'] == dist].groupby('date').agg({
+                'units_consumed': 'sum',
+                'patient_footfall': 'sum'
+            }).reset_index().sort_values('date')
+            
+            y_raw = dist_slice['units_consumed'].values
+            footfall = dist_slice['patient_footfall'].values
+            if len(y_raw) > 14:
+                x1 = np.roll(y_raw, 1)
+                x2 = np.roll(y_raw, 7)
+                x3 = footfall
+                X = np.column_stack([x1[7:], x2[7:], x3[7:]])
+                y = y_raw[7:]
+                client_data[dist] = (X, y)
+
+    # 4. FedAvg Execution Engine
+    local_splits = {}
+    total_samples = 0
+    for p in participants:
+        X_p, y_p = client_data[p]
+        # Standardize features strictly locally
+        mu, std = X_p.mean(axis=0), X_p.std(axis=0) + 1e-6
+        X_norm = (X_p - mu) / std
+        y_mu, y_std = y_p.mean(), y_p.std() + 1e-6
+        y_norm = (y_p - y_mu) / y_std
+
+        split = int(0.8 * len(X_norm))
+        local_splits[p] = {
+            'X_tr': X_norm[:split], 'y_tr': y_norm[:split],
+            'X_te': X_norm[split:], 'y_te': y_norm[split:],
+            'y_scale': (y_mu, y_std), 'n': split
+        }
+        total_samples += split
+
+    def compute_mape(w, X, y, y_scale):
+        y_pred_norm = X @ w
+        y_pred = (y_pred_norm * y_scale[1]) + y_scale[0]
+        y_true = (y * y_scale[1]) + y_scale[0]
+        y_true_safe = np.where(y_true <= 0, 1.0, y_true)
+        return float(np.mean(np.abs((y_true - y_pred) / y_true_safe)) * 100)
+
+    # Benchmark A: Pure Local Models (No knowledge sharing)
+    local_only_mapes = {}
+    for p in participants:
+        X_tr = local_splits[p]['X_tr']
+        y_tr = local_splits[p]['y_tr']
+        w_local = np.zeros(X_tr.shape[1])
+        for _ in range(rounds * epochs):
+            grad = (2 / len(X_tr)) * X_tr.T @ (X_tr @ w_local - y_tr)
+            w_local -= 0.05 * grad
+        local_only_mapes[p] = compute_mape(w_local, local_splits[p]['X_te'], local_splits[p]['y_te'], local_splits[p]['y_scale'])
+
+    # Benchmark B: Centralized Model (Theoretical upper bound; violates privacy)
+    X_cent = np.vstack([local_splits[p]['X_tr'] for p in participants])
+    y_cent = np.concatenate([local_splits[p]['y_tr'] for p in participants])
+    w_cent = np.zeros(X_cent.shape[1])
+    for _ in range(rounds * epochs):
+        grad = (2 / len(X_cent)) * X_cent.T @ (X_cent @ w_cent - y_cent)
+        w_cent -= 0.05 * grad
+
+    centralized_mapes = {
+        p: compute_mape(w_cent, local_splits[p]['X_te'], local_splits[p]['y_te'], local_splits[p]['y_scale'])
+        for p in participants
+    }
+
+    # FedAvg Simulation Loop
+    w_global = np.zeros(3)
+    round_errors = []
+
+    for r in range(rounds):
+        client_weights = []
+        client_sizes = []
+
+        # Local node training
+        for p in participants:
+            w_client = w_global.copy()
+            X_tr = local_splits[p]['X_tr']
+            y_tr = local_splits[p]['y_tr']
+
+            for _ in range(epochs):
+                grad = (2 / len(X_tr)) * X_tr.T @ (X_tr @ w_client - y_tr)
+                w_client -= 0.05 * grad
+
+            # Differential Privacy: Clip gradient update and add Gaussian noise
+            if enable_dp:
+                delta = w_client - w_global
+                l2_norm = np.linalg.norm(delta)
+                if l2_norm > dp_clip:
+                    delta = delta * (dp_clip / l2_norm)
+                delta += np.random.normal(0, dp_noise, size=delta.shape)
+                w_client = w_global + delta
+
+            client_weights.append(w_client)
+            client_sizes.append(local_splits[p]['n'])
+
+        # Server-side Federated Averaging
+        w_global = np.zeros_like(w_global)
+        for w_c, n_c in zip(client_weights, client_sizes):
+            w_global += (n_c / total_samples) * w_c
+
+        # Track round-by-round global performance
+        avg_round_mape = np.mean([
+            compute_mape(w_global, local_splits[p]['X_te'], local_splits[p]['y_te'], local_splits[p]['y_scale'])
+            for p in participants
+        ])
+        round_errors.append({'Round': r + 1, 'Federated MAPE (%)': avg_round_mape})
+
+    fed_mapes = {
+        p: compute_mape(w_global, local_splits[p]['X_te'], local_splits[p]['y_te'], local_splits[p]['y_scale'])
+        for p in participants
+    }
+
+    # 5. Display Convergence Curve
+    with c_right:
+        st.subheader("📉 Collaborative Convergence Curve")
+        loss_df = pd.DataFrame(round_errors)
+        fig_loss = px.line(
+            loss_df, x='Round', y='Federated MAPE (%)',
+            markers=True, line_shape="spline",
+            title="Global Forecast Error (MAPE) Across FedAvg Rounds"
+        )
+        fig_loss.update_traces(line_color="#00A86B", line_width=3)
+        fig_loss.update_layout(hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig_loss, width="stretch")
+
+    # 6. Comparative Model Table
+    st.subheader("⚖️ Model Benchmark: Local vs. Federated vs. Centralized")
+    comparison_rows = []
+    for p in participants:
+        comparison_rows.append({
+            "Participant Node": p,
+            "Local-Only MAPE": f"{local_only_mapes[p]:.2f}%",
+            "Federated MAPE": f"{fed_mapes[p]:.2f}%",
+            "Centralized MAPE": f"{centralized_mapes[p]:.2f}%",
+            "Privacy": "🔒 Zero Shared"
+        })
+
+    comp_df = pd.DataFrame(comparison_rows)
+    st.dataframe(comp_df, width="stretch", hide_index=True)
+    st.caption("BRICS node data is simulated to demonstrate the cross-border protocol. District data comes from the platform's own PHC dataset.")
+    
+    # 7. Privacy Architecture Explanation
+    st.subheader("🛡️ How Federated Learning Protects Health Sovereignty")
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        st.markdown("""
+        **1. On-Premise Training**  
+        Patient records, consumption spikes, and inventory levels never leave local servers. All feature transformations occur behind sovereign firewalls.
+        """)
+    with e2:
+        st.markdown("""
+        **2. Secure Aggregation (FedAvg)**  
+        Local nodes compute model weights using local SGD. The central server computes a weighted average of model parameters, never seeing the underlying data.
+        """)
+    with e3:
+        st.markdown(f"""
+        **3. Differential Privacy ({'Active' if enable_dp else 'Disabled'})**  
+        Weight updates are clipped with an $L_2$ norm threshold and perturbed with Gaussian noise, making it very difficult to reconstruct any individual health transaction from a shared update.
+        """)
+
 
 # 4. Page Logic
 if page == "Overview":
@@ -176,12 +398,12 @@ if page == "Overview":
     mon_end = min(pd.Timestamp(last_dt.year, 9, 30), last_dt)
     if last_dt >= mon_start:
         fig_trend.add_vrect(x0=mon_start, x1=mon_end, fillcolor="red", opacity=0.1, annotation_text="Monsoon Spike")
-    st.plotly_chart(fig_trend, use_container_width=True)
+    st.plotly_chart(fig_trend, width="stretch")
 
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("PHCs Needing Attention")
-        st.dataframe(df_latest[['phc_name', 'medicine', 'closing_stock']].sort_values('closing_stock').head(15).style.background_gradient(cmap='Reds_r'), use_container_width=True, hide_index=True)
+        st.dataframe(df_latest[['phc_name', 'medicine', 'closing_stock']].sort_values('closing_stock').head(15).style.background_gradient(cmap='Reds_r'), width="stretch", hide_index=True)
     with c2:
         st.subheader("Geographic Distribution")
         st.map(df_latest[['latitude', 'longitude']].drop_duplicates(), size=20)
@@ -200,7 +422,7 @@ elif page == "PHC Explorer":
     
     st.table(latest_phc[['medicine', 'opening_stock', 'units_consumed', 'closing_stock']])
     fig_f = px.area(phc_data.groupby('date')['patient_footfall'].first().reset_index(), x='date', y='patient_footfall', title="Patient History")
-    st.plotly_chart(fig_f, use_container_width=True)
+    st.plotly_chart(fig_f, width="stretch")
 
 elif page == "Demand Forecast":
     st.title("Medicine Demand Forecasting")
@@ -212,7 +434,6 @@ elif page == "Demand Forecast":
     with f2:
         sel_med = st.selectbox("Select Medicine", all_medicines)
     
-    # Prepare Time Series Data
     ts = df[(df['phc_name'] == sel_phc) & (df['medicine'] == sel_med)].sort_values('date')
     
     # 1. Forecast Generation
@@ -221,10 +442,9 @@ elif page == "Demand Forecast":
     # 2. Back-testing for MAPE
     train_ts = ts.iloc[:-30].copy()
     test_actuals = ts.iloc[-30:].copy()
-    if len(train_ts) > 60: # Ensure enough data to train
+    if len(train_ts) > 60:
         backtest_forecast = run_forecast_logic(train_ts, forecast_days=30)
         merged = pd.merge(test_actuals[['date', 'units_consumed']], backtest_forecast[['date', 'units_consumed']], on='date', suffixes=('_act', '_pred'))
-        # Avoid division by zero
         merged = merged[merged['units_consumed_act'] > 0]
         mape = np.mean(np.abs((merged['units_consumed_act'] - merged['units_consumed_pred']) / merged['units_consumed_act'])) * 100
     else:
@@ -241,9 +461,8 @@ elif page == "Demand Forecast":
                            title=f"30-Day Demand Projection: {sel_med} at {sel_phc}")
     
     fig_forecast.update_layout(hovermode="x unified")
-    st.plotly_chart(fig_forecast, use_container_width=True)
+    st.plotly_chart(fig_forecast, width="stretch")
     
-    # 4. Metrics & Explanation
     c1, c2 = st.columns([1, 3])
     with c1:
         st.metric("Forecast Error (MAPE)", f"{mape:.2f}%", delta="Back-tested", delta_color="off")
@@ -259,28 +478,23 @@ elif page == "Demand Forecast":
 elif page == "Stock-out Alerts":
     st.title("Stock-out Alerts & Early Warning")
 
-    # Apply district filter
     df_filtered = df[df['district'].isin(selected_districts)]
 
     if df_filtered.empty:
         st.warning("Please select at least one district with available data.")
     else:
-        # 1. Most recent date's closing_stock as current_stock
         df_latest_stock = df_filtered[df_filtered['date'] == latest_date][
             ['phc_name', 'district', 'medicine', 'closing_stock']
         ].rename(columns={'closing_stock': 'current_stock'})
 
-        # 2. Average daily consumption over the last 30 days
         cutoff_date = latest_date - pd.Timedelta(days=30)
         df_last_30 = df_filtered[df_filtered['date'] > cutoff_date]
         avg_cons = df_last_30.groupby(['phc_name', 'district', 'medicine'])['units_consumed'].mean().reset_index()
         avg_cons.rename(columns={'units_consumed': 'avg_daily_consumption'}, inplace=True)
 
-        # Merge current stock and consumption
         alerts_df = pd.merge(df_latest_stock, avg_cons, on=['phc_name', 'district', 'medicine'], how='left')
         alerts_df['avg_daily_consumption'] = alerts_df['avg_daily_consumption'].fillna(0.0)
 
-        # 3. Compute days_until_stockout logic
         def compute_stockout_info(row):
             stock = row['current_stock']
             cons = row['avg_daily_consumption']
@@ -295,7 +509,6 @@ elif page == "Stock-out Alerts":
         alerts_df['days_numeric'] = [r[0] for r in res]
         alerts_df['days_until_stockout'] = [r[1] for r in res]
 
-        # 4. Display Metrics
         stocking_out_15 = (alerts_df['days_numeric'] <= 15).sum()
         already_zero = (alerts_df['current_stock'] <= 0).sum()
 
@@ -303,10 +516,8 @@ elif page == "Stock-out Alerts":
         m1.metric("Pairs Stocking Out Within 15 Days", f"{stocking_out_15:,}")
         m2.metric("Pairs Already at Zero Stock", f"{already_zero:,}")
 
-        # 5. Slider for threshold
         threshold = st.slider("Show alerts within X days", min_value=1, max_value=60, value=15, step=1)
 
-        # 6. Filter and sort table (most urgent first)
         table_df = alerts_df[alerts_df['days_numeric'] <= threshold].copy()
         table_df.sort_values(by=['days_numeric', 'current_stock'], ascending=[True, True], inplace=True)
 
@@ -314,7 +525,6 @@ elif page == "Stock-out Alerts":
         display_df['avg_daily_consumption'] = display_df['avg_daily_consumption'].round(2)
         display_df['current_stock'] = display_df['current_stock'].astype(int)
 
-        # 7. Row coloring: red for under 7 days, amber for 7-15 days
         def highlight_urgency(row):
             val = row['days_until_stockout']
             if val == "STOCKED OUT":
@@ -333,12 +543,11 @@ elif page == "Stock-out Alerts":
             st.info(f"No stock-out alerts found within {threshold} days for the selected district(s).")
         else:
             styled_table = display_df.style.apply(highlight_urgency, axis=1)
-            st.dataframe(styled_table, use_container_width=True, hide_index=True)
+            st.dataframe(styled_table, width="stretch", hide_index=True)
 
 elif page == "AI Redistribution":
     st.title("AI-Driven Inter-PHC Medicine Redistribution")
 
-    # Initialize approval session state
     if "approved_transfers" not in st.session_state:
         st.session_state.approved_transfers = set()
 
@@ -347,10 +556,8 @@ elif page == "AI Redistribution":
     if df_filtered.empty:
         st.warning("Please select at least one district with available data.")
     else:
-        # 1. Latest stock data
         latest_df = df_filtered[df_filtered['date'] == latest_date].copy()
 
-        # 2. Average daily consumption over the last 30 days
         cutoff_date = latest_date - pd.Timedelta(days=30)
         df_last_30 = df_filtered[df_filtered['date'] > cutoff_date]
         avg_cons = df_last_30.groupby(['phc_name', 'district', 'medicine'])['units_consumed'].mean().reset_index()
@@ -364,24 +571,18 @@ elif page == "AI Redistribution":
         )
         stock_df['avg_daily_consumption'] = stock_df['avg_daily_consumption'].fillna(0.0)
 
-        # PHC coordinates lookup
         coords = df[['phc_name', 'latitude', 'longitude']].dropna().drop_duplicates('phc_name').set_index('phc_name')
-
-        # Baseline medicine consumption across filtered data (for items with 0 recent consumption)
         med_avg_dict = df_filtered.groupby('medicine')['units_consumed'].mean().to_dict()
 
-        # 3. Generate Redistribution Recommendations
         recommendations = []
         for med in sorted(stock_df['medicine'].unique()):
             med_df = stock_df[stock_df['medicine'] == med]
 
-            # Deficit: < 15 days supply or already stocked out (closing_stock <= 0)
             deficit_phcs = med_df[
                 (med_df['closing_stock'] <= 0) |
                 ((med_df['avg_daily_consumption'] > 0) & ((med_df['closing_stock'] / med_df['avg_daily_consumption']) < 15))
             ]
 
-            # Surplus: > 60 days supply
             surplus_phcs = med_df[
                 (med_df['avg_daily_consumption'] > 0) &
                 ((med_df['closing_stock'] / med_df['avg_daily_consumption']) > 60)
@@ -396,7 +597,6 @@ elif page == "AI Redistribution":
                 dst_stock = def_row['closing_stock']
                 dst_cons = def_row['avg_daily_consumption']
 
-                # Effective consumption for calculating 30-day target
                 eff_dst_cons = dst_cons if dst_cons > 0 else med_avg_dict.get(med, 1.0)
                 if eff_dst_cons <= 0:
                     eff_dst_cons = 1.0
@@ -407,7 +607,6 @@ elif page == "AI Redistribution":
 
                 lat_dst, lon_dst = coords.loc[dst_phc, 'latitude'], coords.loc[dst_phc, 'longitude']
 
-                # Find nearest surplus PHC with the same medicine
                 best_surplus = None
                 min_dist = float('inf')
 
@@ -426,7 +625,6 @@ elif page == "AI Redistribution":
                     src_stock = best_surplus['closing_stock']
                     src_cons = best_surplus['avg_daily_consumption']
 
-                    # Surplus excess beyond 60 days
                     excess = max(0.0, src_stock - (60 * src_cons))
                     max_allowed = 0.5 * excess
 
@@ -445,7 +643,6 @@ elif page == "AI Redistribution":
                             'days_prevented': days_prevented
                         })
 
-        # 4. Display Metrics
         total_transfers = len(recommendations)
         total_units = sum(r['transfer_quantity'] for r in recommendations)
         approved_count = sum(1 for r in recommendations if r['rec_id'] in st.session_state.approved_transfers)
@@ -460,7 +657,6 @@ elif page == "AI Redistribution":
         if total_transfers == 0:
             st.info("No inter-PHC redistribution opportunities found under the current criteria for the selected district(s).")
         else:
-            # 5. Approval Mechanism Controls
             ctrl1, ctrl2, ctrl3 = st.columns([2, 1, 1])
             with ctrl1:
                 pending_options = [r['rec_id'] for r in recommendations if r['rec_id'] not in st.session_state.approved_transfers]
@@ -474,18 +670,17 @@ elif page == "AI Redistribution":
             with ctrl2:
                 st.write("")
                 st.write("")
-                if st.button("✅ Approve All Transfers", use_container_width=True):
+                if st.button("✅ Approve All Transfers", width="stretch"):
                     for r in recommendations:
                         st.session_state.approved_transfers.add(r['rec_id'])
                     st.rerun()
             with ctrl3:
                 st.write("")
                 st.write("")
-                if st.button("🔄 Reset Approvals", use_container_width=True):
+                if st.button("🔄 Reset Approvals", width="stretch"):
                     st.session_state.approved_transfers.clear()
                     st.rerun()
 
-            # 6. Recommendations Table
             table_records = []
             for r in recommendations:
                 status = "Approved" if r['rec_id'] in st.session_state.approved_transfers else "Pending"
@@ -508,13 +703,15 @@ elif page == "AI Redistribution":
                 return ['background-color: #fff3cd; color: #856404; font-weight: 500;'] * len(row)
 
             styled_rec_table = rec_df.style.apply(highlight_status, axis=1)
-            st.dataframe(styled_rec_table, use_container_width=True, hide_index=True)
-            
+            st.dataframe(styled_rec_table, width="stretch", hide_index=True)
+
+elif page == "Federated Learning":
+    render_federated_learning(df, selected_districts)
+
 elif page == "Ask AI":
     st.title("🤖 Ask AI - Health Resource & Supply Chain Intelligence")
     st.markdown("Generate automated health executive briefings or ask specific operational questions powered by Gemini.")
 
-    # Context builder for Gemini
     df_filtered = df[df['district'].isin(selected_districts)]
     df_latest = df_filtered[df_filtered['date'] == latest_date]
     total_phcs = df_latest['phc_id'].nunique()
@@ -540,7 +737,6 @@ elif page == "Ask AI":
     Always answer using specific PHC names and stock numbers from this table.
     """
 
-    # Section 1: Executive Briefing
     st.subheader("📋 Executive Briefing")
     st.markdown("Generate a real-time operational summary highlighting stock emergencies, utilization, and priority interventions.")
 
@@ -563,11 +759,9 @@ elif page == "Ask AI":
 
     st.divider()
 
-    # Section 2: Interactive Question Answering
     st.subheader("💬 Ask a Specific Question")
     st.markdown("Inquire about medicine stock levels, trends, bed occupancy, or redistribution advice.")
 
-    # Preset quick questions
     quick_col1, quick_col2, quick_col3 = st.columns(3)
     preset_q = None
     if quick_col1.button("🚨 Which PHCs need immediate stock intervention?"):
